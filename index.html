@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Serverless Encrypted ChatApp</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; background: #f2f2f2; }
+    #login, #chat { max-width: 800px; margin: 20px auto; padding: 20px; background: white; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+    input, button, textarea { font-size: 1em; padding: 8px; margin: 4px 0; }
+    #messages { border: 1px solid #ddd; padding: 10px; height: 300px; overflow-y: auto; background: #fafafa; }
+    video { width: 300px; height: 225px; background: #000; margin: 5px; }
+    .flex { display: flex; flex-wrap: wrap; gap: 10px; }
+  </style>
+</head>
+<body>
+  <!-- Login/Room selection -->
+  <div id="login">
+    <h2>Join a Chat Room</h2>
+    <input type="text" id="room" placeholder="Room name (e.g. myRoom)">
+    <br>
+    <input type="password" id="password" placeholder="Enter shared password">
+    <br>
+    <button id="joinRoom">Join Room</button>
+  </div>
+  
+  <!-- Chat UI -->
+  <div id="chat" style="display:none;">
+    <h2>Chat Room: <span id="roomNameDisplay"></span></h2>
+    <div id="messages"></div>
+    <input type="text" id="messageInput" placeholder="Type your message here">
+    <button id="sendMessage">Send Message</button>
+    <br>
+    <label>Send File (images/videos/audio): </label>
+    <input type="file" id="fileInput">
+    <button id="sendFile">Send File</button>
+    <hr>
+    <h3>Manual WebRTC Signaling (for P2P connection)</h3>
+    <div class="flex">
+      <button id="createOffer">Create Offer</button>
+      <textarea id="offerText" placeholder="Offer (auto-filled)"></textarea>
+    </div>
+    <div class="flex">
+      <button id="setRemoteOffer">Set Remote Offer (to Answer)</button>
+      <textarea id="answerText" placeholder="Answer (auto-filled on answer creation)"></textarea>
+      <button id="setRemoteAnswer">Set Remote Answer</button>
+    </div>
+    <hr>
+    <h3>Call (Audio/Video)</h3>
+    <button id="startCall">Start Call (getUserMedia &amp; add stream)</button>
+    <div class="flex">
+      <div>
+        <p>Your Video:</p>
+        <video id="localVideo" autoplay muted></video>
+      </div>
+      <div>
+        <p>Peer Video:</p>
+        <video id="remoteVideo" autoplay></video>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Global variables
+    let aesKey, roomName, chatHistory = [];
+    let pc, dataChannel;
+
+    // Derive a key by hashing the password 5 times with SHA-256 and then importing it for AES-GCM.
+    async function deriveKey(password) {
+      const encoder = new TextEncoder();
+      let data = encoder.encode(password);
+      for (let i = 0; i < 5; i++) {
+        data = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+      }
+      return await crypto.subtle.importKey('raw', data, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    }
+
+    // Encrypt a string using AES-GCM. Returns base64 encoded string (IV + ciphertext).
+    async function encryptData(plainText) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encoded = new TextEncoder().encode(plainText);
+      const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, aesKey, encoded);
+      const combined = new Uint8Array(iv.byteLength + ciphertext.byteLength);
+      combined.set(iv);
+      combined.set(new Uint8Array(ciphertext), iv.byteLength);
+      // Convert to base64 string
+      return btoa(String.fromCharCode(...combined));
+    }
+
+    // Decrypt a base64 encoded (IV + ciphertext) string.
+    async function decryptData(cipherBase64) {
+      const combined = Uint8Array.from(atob(cipherBase64), c => c.charCodeAt(0));
+      const iv = combined.slice(0, 12);
+      const ciphertext = combined.slice(12);
+      try {
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, aesKey, ciphertext);
+        return new TextDecoder().decode(decrypted);
+      } catch(e) {
+        console.error("Decryption failed", e);
+        return "";
+      }
+    }
+
+    // Save chat history (encrypted) in localStorage
+    function saveChat() {
+      encryptData(JSON.stringify(chatHistory)).then(encrypted => {
+        localStorage.setItem('chat_' + roomName, encrypted);
+      });
+    }
+
+    // Load chat history from localStorage and decrypt it.
+    async function loadChat() {
+      const encrypted = localStorage.getItem('chat_' + roomName);
+      if (encrypted) {
+        const decrypted = await decryptData(encrypted);
+        try {
+          chatHistory = JSON.parse(decrypted);
+          displayChat();
+        } catch(e) {
+          console.error("Failed to parse chat history", e);
+        }
+      }
+    }
+
+    // Display chat messages in the UI.
+    function displayChat() {
+      const messagesDiv = document.getElementById('messages');
+      messagesDiv.innerHTML = "";
+      chatHistory.forEach(msg => {
+        const div = document.createElement('div');
+        div.textContent = msg;
+        messagesDiv.appendChild(div);
+      });
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    // Append a message to chat history.
+    function addMessage(msg) {
+      chatHistory.push(msg);
+      displayChat();
+      saveChat();
+    }
+
+    // UI: When joining a room, derive the AES key and load stored messages.
+    document.getElementById('joinRoom').addEventListener('click', async () => {
+      roomName = document.getElementById('room').value.trim();
+      const password = document.getElementById('password').value;
+      if (!roomName || !password) {
+        alert("Room name and password are required.");
+        return;
+      }
+      aesKey = await deriveKey(password);
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('chat').style.display = 'block';
+      document.getElementById('roomNameDisplay').textContent = roomName;
+      loadChat();
+    });
+
+    // Send text message: add to local chat and send encrypted over data channel (if available).
+    document.getElementById('sendMessage').addEventListener('click', async () => {
+      const message = document.getElementById('messageInput').value;
+      if (message) {
+        addMessage("You: " + message);
+        document.getElementById('messageInput').value = "";
+        if (dataChannel && dataChannel.readyState === 'open') {
+          const encrypted = await encryptData(message);
+          dataChannel.send(encrypted);
+        }
+      }
+    });
+
+    // Send a file: read the file, convert to base64, encrypt it, then send.
+    document.getElementById('sendFile').addEventListener('click', async () => {
+      const file = document.getElementById('fileInput').files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = async function(e) {
+          // Convert file data to base64
+          const base64 = btoa(String.fromCharCode(...new Uint8Array(e.target.result)));
+          const encrypted = await encryptData(base64);
+          if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(encrypted);
+            addMessage("You sent a file: " + file.name);
+          }
+        };
+        reader.readAsArrayBuffer(file);
+      }
+    });
+
+    // --- WebRTC Setup for Peer-to-Peer Communication ---
+    function initPeerConnection() {
+      const configuration = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+      pc = new RTCPeerConnection(configuration);
+
+      // If we create the data channel (as the offerer)
+      try {
+        dataChannel = pc.createDataChannel("chat");
+        dataChannel.onopen = () => console.log("Data channel open");
+        dataChannel.onmessage = async (event) => {
+          const decrypted = await decryptData(event.data);
+          addMessage("Peer: " + decrypted);
+        };
+      } catch(e) {
+        console.error("Data channel creation error:", e);
+      }
+      
+      // When receiving a data channel (as the answerer)
+      pc.ondatachannel = (event) => {
+        dataChannel = event.channel;
+        dataChannel.onmessage = async (event) => {
+          const decrypted = await decryptData(event.data);
+          addMessage("Peer: " + decrypted);
+        };
+      };
+
+      // ICE candidate handling – when gathering is complete, output the local description
+      pc.onicecandidate = (event) => {
+        if (event.candidate === null && pc.localDescription) {
+          document.getElementById('offerText').value = JSON.stringify(pc.localDescription);
+        }
+      };
+
+      // When remote stream is added, attach it to the video element
+      pc.ontrack = (event) => {
+        document.getElementById('remoteVideo').srcObject = event.streams[0];
+      };
+    }
+
+    // Create offer button (for caller)
+    document.getElementById('createOffer').addEventListener('click', async () => {
+      initPeerConnection();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+    });
+
+    // When receiving an offer, set it and create an answer.
+    document.getElementById('setRemoteOffer').addEventListener('click', async () => {
+      const offer = JSON.parse(document.getElementById('offerText').value);
+      initPeerConnection();
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      document.getElementById('answerText').value = JSON.stringify(pc.localDescription);
+    });
+
+    // When the answer is pasted, set it as remote description.
+    document.getElementById('setRemoteAnswer').addEventListener('click', async () => {
+      const answer = JSON.parse(document.getElementById('answerText').value);
+      await pc.setRemoteDescription(answer);
+    });
+
+    // Start a call: get user media and add the stream to the RTCPeerConnection.
+    document.getElementById('startCall').addEventListener('click', async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        document.getElementById('localVideo').srcObject = stream;
+        stream.getTracks().forEach(track => {
+          pc.addTrack(track, stream);
+        });
+      } catch(e) {
+        console.error("getUserMedia error:", e);
+      }
+    });
+  </script>
+</body>
+</html> 
